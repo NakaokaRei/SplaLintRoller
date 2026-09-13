@@ -11,13 +11,14 @@ final class RollerSession: NSObject, ObservableObject {
         ARWorldTrackingConfiguration.isSupported && ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
     }
     enum Phase: Equatable {
-        case preparing, unavailable, scanning, readyToSelect, selecting, initializing, tracking, searching, lost
+        case preparing, unavailable, scanning, readyToSelect, selecting, initializing, tracking, lost
     }
 
     @Published private(set) var phase: Phase = .preparing
     @Published private(set) var message = "カメラを準備しています"
     @Published private(set) var isPainting = false
     @Published private(set) var canPaint = false
+    @Published private(set) var trackingUncertain = false
     @Published private(set) var cameraNormal = false
     @Published private(set) var cameraDenied = false
     @Published private(set) var frozenImage: UIImage?
@@ -34,6 +35,7 @@ final class RollerSession: NSObject, ObservableObject {
     private var tracker = RollerTracker()
     private let renderer = InkRenderer()
     private let occlusion = SceneOcclusion()
+    private let liveDepthOcclusion = LiveDepthOcclusion()
     private let imageContext = CIContext()
     private var stroke = StrokeBuilder()
     private var movement = StrokeBuilder()
@@ -45,9 +47,7 @@ final class RollerSession: NSObject, ObservableObject {
     private var configured = false
     private var recovering = false
     private var recoveryTask: Task<Void, Never>?
-    private var lastSampleTime: TimeInterval?
-    private var hasRecoveryTemplate = false
-    private var lastSearchTime: TimeInterval = -.infinity
+    private var tolerance = TrackingTolerance()
 
     var canSelect: Bool {
         floor != nil && cameraNormal && !recovering && phase != .initializing && phase != .selecting
@@ -62,6 +62,7 @@ final class RollerSession: NSObject, ObservableObject {
         // The custom mesh excludes the selected floor, unlike the built-in option.
         view.environment.sceneUnderstanding.options.remove(.occlusion)
         occlusion.connect(view)
+        liveDepthOcclusion.connect(view)
     }
 
     func activate() async {
@@ -102,10 +103,11 @@ final class RollerSession: NSObject, ObservableObject {
         recoveryTask?.cancel()
         invalidateTracking()
         cameraNormal = false
+        liveDepthOcclusion.suspend()
         view?.session.pause()
         if configured {
-            phase = floor == nil ? .scanning : (hasRecoveryTemplate ? .searching : .readyToSelect)
-            message = "再開後にローラーをカメラに戻してください"
+            phase = floor == nil ? .scanning : .readyToSelect
+            message = "再開後にローラーを再指定してください"
         }
     }
 
@@ -133,9 +135,9 @@ final class RollerSession: NSObject, ObservableObject {
             recovering = false
             invalidateTracking()
             floor = nil
-            hasRecoveryTemplate = false
             renderer.remove()
             occlusion.reset()
+            liveDepthOcclusion.reset()
             hasInk = false
             cameraNormal = false
             phase = .scanning
@@ -145,7 +147,7 @@ final class RollerSession: NSObject, ObservableObject {
 
     private func resume() {
         invalidateTracking()
-        phase = floor == nil ? .scanning : (hasRecoveryTemplate ? .searching : .readyToSelect)
+        phase = floor == nil ? .scanning : .readyToSelect
         recovering = floor != nil
         message = recovering ? "床の位置を復元しています。元の床にカメラを向けてください" : "床を映してタップしてください"
         run(reset: false)
@@ -171,6 +173,7 @@ final class RollerSession: NSObject, ObservableObject {
         }
         floor = plane
         occlusion.floorChanged()
+        liveDepthOcclusion.suspend()
         renderer.attach(to: view, floor: plane)
         phase = .readyToSelect
         message = "床を選択しました。ローラーを床に置き、「ローラーを指定」を押してください"
@@ -180,7 +183,6 @@ final class RollerSession: NSObject, ObservableObject {
         guard canSelect, let view, let frame = view.session.currentFrame,
               view.bounds.width > 0, view.bounds.height > 0 else { return }
         invalidateTracking()
-        hasRecoveryTemplate = false
         let transform = frame.displayTransform(for: .portrait, viewportSize: view.bounds.size)
         let raw = CIImage(cvPixelBuffer: frame.capturedImage)
         guard let cgImage = imageContext.createCGImage(raw, from: raw.extent) else {
@@ -215,16 +217,16 @@ final class RollerSession: NSObject, ObservableObject {
         tracker = worker
         Task { [weak self] in
             do {
-                let canRecover = try await worker.seed(frame: frame, box: box)
+                try await worker.seed(frame: frame, box: box)
                 guard let self, self.generation == token, self.active else { return }
-                self.hasRecoveryTemplate = canRecover
+                self.tolerance.begin(at: self.view?.session.currentFrame?.timestamp ?? frame.timestamp)
                 self.frozenFrame = nil
                 self.frozenImage = nil
                 self.phase = .tracking
                 self.message = "追跡位置を確認しています。ローラーを床に置いてください"
             } catch {
                 guard let self, self.generation == token else { return }
-                self.loseTracking("ローラーを指定できませんでした。もう一度囲んでください", allowRecovery: false)
+                self.loseTracking("ローラーを指定できませんでした。もう一度囲んでください")
             }
         }
     }
@@ -269,73 +271,44 @@ final class RollerSession: NSObject, ObservableObject {
         pausePainting()
         canPaint = false
         movement.breakStroke()
-        lastSampleTime = nil
+        tolerance.reset()
+        trackingUncertain = false
         trackingBox = nil
         frozenImage = nil
         frozenFrame = nil
         renderer.showContact(nil)
     }
 
-    private func loseTracking(_ reason: String, allowRecovery: Bool = true) {
+    private func loseTracking(_ reason: String) {
         invalidateTracking()
-        lastSearchTime = -.infinity
-        if floor != nil && hasRecoveryTemplate && allowRecovery {
-            phase = .searching
-            message = reason + " ローラーをカメラに戻してください。撮り直さずに探します"
-        } else {
-            phase = floor == nil ? .scanning : .lost
-            message = reason
-            if floor != nil && allowRecovery {
-                message += " 見分ける特徴が少ないため、ローラーの輪郭を含めて再指定してください"
-            }
-        }
+        phase = floor == nil ? .scanning : .lost
+        message = reason
     }
 
-    private func searchForRoller(frame: ARFrame) {
-        guard !inFlight, !recovering, let view,
-              frame.timestamp - lastSearchTime >= 0.25 else { return }
-        lastSearchTime = frame.timestamp
-        inFlight = true
-        let token = generation
-        let worker = tracker
-        let viewport = view.bounds.size
-        let transform = frame.displayTransform(for: .portrait, viewportSize: viewport)
-        let visible = TrackingGeometry.unitRect.applying(transform.inverted()).intersection(TrackingGeometry.unitRect)
-        Task { [weak self] in
-            defer { self?.inFlight = false }
-            do {
-                let observation = try await worker.recover(frame: frame, visibleRect: visible, generation: token)
-                guard let self, self.generation == token, self.active, self.cameraNormal,
-                      self.phase == .searching, !self.recovering,
-                      let observation, let current = self.view?.session.currentFrame,
-                      current.timestamp - frame.timestamp <= 0.5 else { return }
-                // Floor projection still has to pass. Never resume painting automatically
-                // and never connect the stroke from before the loss.
-                self.movement.breakStroke()
-                self.stroke.breakStroke()
-                self.phase = .tracking
-                self.process(observation, frame: frame, viewport: viewport,
-                             paintingToken: self.paintingGeneration)
-                if self.phase == .tracking, self.canPaint {
-                    self.message = "ローラーが見つかりました。黄色の点を確認して「塗り始める」で再開できます"
-                    await worker.accept(observation)
-                }
-            } catch {
-                guard let self, self.generation == token, self.phase == .searching else { return }
-                self.message = "ローラーを探しています。明るい床に置いてカメラに戻してください"
-            }
+    private func holdTracking(_ reason: String, at time: TimeInterval) {
+        guard phase == .tracking else { return }
+        if tolerance.hasExpired(at: time) {
+            loseTracking(reason + " ローラーを再指定してください")
+            return
         }
+        // Keep the same Vision request alive, but never paint uncertain samples or
+        // bridge the hidden interval. The user's start/pause intent is preserved.
+        if !trackingUncertain { paintingGeneration += 1 }
+        trackingUncertain = true
+        canPaint = false
+        stroke.breakStroke()
+        movement.breakStroke()
+        renderer.showContact(nil)
+        trackingBox = nil
+        message = reason + " 少し待っています。ローラーを映し続けてください"
     }
 
     private func process(_ observation: RollerObservation, frame: ARFrame, viewport: CGSize,
                          paintingToken: Int) {
         let transform = frame.displayTransform(for: .portrait, viewportSize: viewport)
         let rect = TrackingGeometry.screenRect(visionRect: observation.box, displayTransform: transform)
-        guard observation.confidence >= 0.6, !rect.isNull,
-              rect.width > 0.01, rect.height > 0.01,
-              rect.minX > 0.005, rect.maxX < 0.995,
-              rect.minY > 0.005, rect.maxY < 0.995 else {
-            loseTracking("ローラーを見失いました。床に置いてください")
+        guard TrackingTolerance.isUsable(confidence: observation.confidence, screenRect: rect) else {
+            holdTracking("ローラーの位置が不確かです。", at: frame.timestamp)
             return
         }
         trackingBox = rect
@@ -348,30 +321,33 @@ final class RollerSession: NSObject, ObservableObject {
                                    allowing: .existingPlaneGeometry, alignment: .horizontal)
         guard let floor, let view,
               let hit = view.session.raycast(query).first(where: { $0.anchor?.identifier == floor.identifier }) else {
-            loseTracking("ローラーの下に選択した床を確認できません。床に置いてください")
+            holdTracking("ローラーの下に選択した床を確認できません。", at: frame.timestamp)
             return
         }
         let hitWorld = hit.worldTransform.columns.3
         guard simd_distance(origin, SIMD3(hitWorld.x, hitWorld.y, hitWorld.z)) <= 3 else {
-            loseTracking("ローラーが遠すぎます。3m以内に戻してください")
+            loseTracking("ローラーが遠すぎます。3m以内で再指定してください")
             return
         }
         let local = simd_inverse(floor.transform) * hitWorld
         let point = SIMD3<Float>(local.x, 0, local.z)
         if case .discontinuity = movement.append(point, at: frame.timestamp) {
-            loseTracking("追跡位置が急に変わったため停止しました。ローラーをカメラに戻してください")
+            loseTracking("追跡位置が急に変わったため停止しました。ローラーを再指定してください")
             return
         }
         renderer.showContact(point)
-        lastSampleTime = frame.timestamp
+        tolerance.accept(at: frame.timestamp)
+        trackingUncertain = false
         if !canPaint {
             canPaint = true
-            message = "黄色の点がローラーの接地点に合うか確認してから、塗り始めてください"
+            message = isPainting
+                ? "追跡が安定しました。塗りを続けています"
+                : "黄色の点がローラーの接地点に合うか確認してから、塗り始めてください"
         }
         guard isPainting, paintingToken == paintingGeneration else { return }
         switch stroke.append(point, at: frame.timestamp) {
         case .discontinuity:
-            loseTracking("軌跡が途切れたため停止しました。ローラーをカメラに戻してください")
+            loseTracking("軌跡が途切れたため停止しました。ローラーを再指定してください")
         case .accepted(let segments):
             do {
                 try renderer.append(segments, width: Float(widthCentimeters / 100))
@@ -394,27 +370,31 @@ extension RollerSession: @MainActor ARSessionDelegate {
         guard active else { return }
         occlusion.update(at: frame.timestamp, floorTransform: floor?.transform)
         if case .normal = frame.camera.trackingState {
+            liveDepthOcclusion.update(frame: frame, floorTransform: floor?.transform)
             cameraNormal = true
             if recovering {
                 recovering = false
                 recoveryTask?.cancel()
-                message = "床の位置を復元しました。ローラーをカメラに戻してください"
+                message = "床の位置を復元しました。ローラーを再指定してください"
             }
         } else {
+            liveDepthOcclusion.suspend()
             cameraNormal = false
-            if phase == .tracking || phase == .selecting || phase == .initializing {
-                loseTracking("カメラの位置追跡が不安定です。床をゆっくり映してください")
+            if phase == .tracking {
+                holdTracking("カメラの位置追跡が不安定です。", at: frame.timestamp)
+            } else if phase == .selecting || phase == .initializing {
+                loseTracking("カメラの位置追跡が不安定です。床を映してローラーを再指定してください")
             }
-            return
-        }
-        if phase == .searching {
-            searchForRoller(frame: frame)
             return
         }
         guard phase == .tracking, let view else { return }
-        if let lastSampleTime, frame.timestamp - lastSampleTime > 0.5 {
-            loseTracking("追跡の更新が途切れたため停止しました。ローラーをカメラに戻してください")
+        if tolerance.hasExpired(at: frame.timestamp) {
+            loseTracking("追跡の更新が途切れたため停止しました。ローラーを再指定してください")
             return
+        }
+        if let lastGoodTime = tolerance.lastGoodTime,
+           frame.timestamp - lastGoodTime > TrackingTolerance.maximumResultAge {
+            holdTracking("追跡結果を待っています。", at: frame.timestamp)
         }
         guard !inFlight else { return }
         inFlight = true
@@ -428,18 +408,16 @@ extension RollerSession: @MainActor ARSessionDelegate {
                 let observation = try await worker.track(frame: frame)
                 guard let self, self.generation == token, self.active, self.phase == .tracking,
                       self.cameraNormal else { return }
-                guard let current = self.view?.session.currentFrame,
-                      current.timestamp - frame.timestamp <= 0.35 else {
-                    self.loseTracking("画像解析が遅れているため停止しました。ローラーをカメラに戻してください")
+                guard let current = self.view?.session.currentFrame else { return }
+                guard TrackingTolerance.isFresh(sampleTime: frame.timestamp, currentTime: current.timestamp) else {
+                    self.holdTracking("画像解析が遅れています。", at: current.timestamp)
                     return
                 }
                 self.process(observation, frame: frame, viewport: viewport, paintingToken: paintingToken)
-                if self.generation == token, self.phase == .tracking {
-                    await worker.accept(observation)
-                }
             } catch {
                 guard let self, self.generation == token else { return }
-                self.loseTracking("画像の追跡に失敗しました。ローラーをカメラに戻してください")
+                self.holdTracking("画像の追跡が途切れています。",
+                                  at: self.view?.session.currentFrame?.timestamp ?? frame.timestamp)
             }
         }
     }
@@ -461,6 +439,7 @@ extension RollerSession: @MainActor ARSessionDelegate {
         // Plane merges can remove the selected anchor. Never attach old ink to a different floor.
         self.floor = nil
         occlusion.floorChanged()
+        liveDepthOcclusion.suspend()
         renderer.remove()
         hasInk = false
         recovering = false
@@ -468,12 +447,13 @@ extension RollerSession: @MainActor ARSessionDelegate {
     }
 
     func sessionWasInterrupted(_ session: ARSession) {
+        liveDepthOcclusion.suspend()
         recoveryTask?.cancel()
         recovering = false
         invalidateTracking()
         cameraNormal = false
-        phase = floor == nil ? .scanning : (hasRecoveryTemplate ? .searching : .readyToSelect)
-        message = "ARが中断されました。再開後にローラーをカメラに戻してください"
+        phase = floor == nil ? .scanning : .readyToSelect
+        message = "ARが中断されました。再開後にローラーを再指定してください"
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
@@ -487,8 +467,8 @@ extension RollerSession: @MainActor ARSessionDelegate {
         invalidateTracking()
         configured = false
         floor = nil
-        hasRecoveryTemplate = false
         occlusion.reset()
+        liveDepthOcclusion.reset()
         renderer.remove()
         hasInk = false
         phase = .unavailable

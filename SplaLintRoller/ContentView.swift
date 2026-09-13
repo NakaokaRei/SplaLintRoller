@@ -83,7 +83,7 @@ struct ContentView: View {
                 Image(systemName: "paintbrush.pointed.fill").foregroundStyle(.pink)
                 Text("コロコロインク").font(.headline)
                 Spacer()
-                Text(model.isPainting ? "塗り中" : (model.phase == .searching ? "再探索中" : "AR試作"))
+                Text(model.trackingUncertain ? "追跡待ち" : (model.isPainting ? "塗り中" : "AR試作"))
                     .font(.caption.bold())
                     .padding(.horizontal, 9).padding(.vertical, 5)
                     .background(model.isPainting ? Color.pink : Color.white.opacity(0.15), in: Capsule())
@@ -115,14 +115,6 @@ struct ContentView: View {
             } else if model.phase == .initializing || model.phase == .preparing {
                 ProgressView().padding()
             } else if model.phase != .scanning {
-                if model.phase == .searching {
-                    HStack(spacing: 10) {
-                        ProgressView()
-                        Text("撮り直し不要 · ローラーをカメラに戻してください")
-                            .font(.caption)
-                    }
-                    .accessibilityIdentifier("rollerRecoveryStatus")
-                }
                 HStack {
                     Text("塗り幅").font(.subheadline)
                     Slider(value: $model.widthCentimeters, in: 5...30, step: 1)
